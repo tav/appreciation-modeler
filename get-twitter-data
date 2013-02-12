@@ -1,0 +1,387 @@
+#! /usr/bin/env python
+
+# Public Domain (-) 2013 The Appreciation Modeler Authors.
+# See the Appreciation Modeler UNLICENSE file for details.
+
+"""Twitter Data Archiver for the Appreciation Modeler"""
+
+from collections import deque
+from os import getcwd, listdir, mkdir
+from os.path import dirname, expanduser, isdir, isfile, join
+from sys import argv, exit, path as sys_path
+from time import sleep, time
+
+sys_path.insert(0, join(dirname(__file__), "third_party"))
+
+from json import loads as decode_json, dumps as encode_json
+from twitter import OAuth, Twitter, oauth_dance, read_token_file
+
+# -----------------------------------------------------------------------------
+# Global Config
+# -----------------------------------------------------------------------------
+
+DEBUG = False
+
+INIT_USER_ID = argv[1:] and argv[1] or "tav"
+
+MAX_DEPTH = 3
+MAX_FRIENDS = 1
+MAX_FRIENDS_BATCH = 3800
+
+# -----------------------------------------------------------------------------
+# Credentials
+# -----------------------------------------------------------------------------
+
+APP_FILE = expanduser("~/.appreciation.model.app.auth")
+USER_FILE = expanduser("~/.appreciation.model.user.auth")
+
+if not isfile(APP_FILE):
+    print "!! ERROR: Couldn't find App's consumer key and secret at:",
+    print APP_FILE
+    exit(1)
+
+CONSUMER_KEY, CONSUMER_SECRET = read_token_file(APP_FILE)
+
+if not isfile(USER_FILE):
+    oauth_dance(
+        "The Appreciation Modeler", CONSUMER_KEY, CONSUMER_SECRET,
+        USER_FILE
+        )
+
+ACCESS_TOKEN, ACCESS_SECRET = read_token_file(USER_FILE)
+
+# -----------------------------------------------------------------------------
+# Data Directories
+# -----------------------------------------------------------------------------
+
+def ensure_directory(*path):
+    path = join(*path)
+    if not isdir(path):
+        mkdir(path)
+    return path
+
+DATA_DIR = ensure_directory(getcwd(), "data")
+ALIAS_DIR = ensure_directory(DATA_DIR, "alias")
+FRIENDS_DIR = ensure_directory(DATA_DIR, "friends")
+USERS_DIR = ensure_directory(DATA_DIR, "users")
+TWEETS_DIR = ensure_directory(DATA_DIR, "tweets")
+
+# -----------------------------------------------------------------------------
+# Twitter Client
+# -----------------------------------------------------------------------------
+
+if DEBUG:
+    print """from twitter import Twitter, OAuth
+client = Twitter(auth=OAuth(%r, %r, %r, %r))""" % (
+    ACCESS_TOKEN, ACCESS_SECRET, CONSUMER_KEY, CONSUMER_SECRET
+    )
+
+client = Twitter(auth=OAuth(
+    ACCESS_TOKEN, ACCESS_SECRET, CONSUMER_KEY, CONSUMER_SECRET
+    ))
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+def read(*path):
+    f = open(join(*path), 'rb')
+    data = f.read()
+    f.close()
+    return data
+
+def read_json(*path):
+    f = open(join(*path), 'rb')
+    data = f.read()
+    f.close()
+    return decode_json(data.decode('utf-8'))
+
+def write(data, filename):
+    f = open(filename, 'wb')
+    f.write(data)
+    f.close()
+
+# -----------------------------------------------------------------------------
+# Convert Screen Name to ID
+# -----------------------------------------------------------------------------
+
+print "// Looking up Screen Name for %s" % INIT_USER_ID
+
+alias_path = join(ALIAS_DIR, INIT_USER_ID)
+if isfile(alias_path):
+    INIT_USER_ID = read(alias_path)
+    INIT_USER = read_json(USERS_DIR, INIT_USER_ID)
+else:
+    print ">> Getting Screen Name for %s" % INIT_USER_ID
+    resp = client.users.lookup(screen_name=INIT_USER_ID, include_entities=False)
+    if not resp:
+        print "!! ERROR: Couldn't find Screen Name for %s" % INIT_USER_ID
+        print "!! X-Rate-Limit-Remaining: %s" % resp.rate_limit_remaining()
+        exit(1)
+    INIT_USER = resp[0]
+    INIT_USER_ID = INIT_USER['id_str']
+    write(encode_json(INIT_USER), join(USERS_DIR, INIT_USER_ID))
+    write(INIT_USER_ID, alias_path)
+
+print "## %s is %s" % (INIT_USER["screen_name"], INIT_USER_ID)
+
+# -----------------------------------------------------------------------------
+# Global State
+# -----------------------------------------------------------------------------
+
+depth_track = [0] * MAX_DEPTH
+depth_track[0] = 1
+seen_users = set([INIT_USER_ID])
+
+friends_queue = deque([[INIT_USER_ID, 0, None, 0]])
+users_queue = deque([INIT_USER_ID])
+tweets_queue = deque([[INIT_USER_ID, 0, 9223372036854775807]])
+
+# -----------------------------------------------------------------------------
+# Core Archive Functions
+# -----------------------------------------------------------------------------
+
+def add_friends(
+    friends, depth, depth_track=depth_track, add_friend=friends_queue.append,
+    add_tweet=tweets_queue.append, add_user=users_queue.append,
+    add_seen=seen_users.add, seen=seen_users,
+    ):
+    if depth == MAX_DEPTH:
+        return
+    for user in map(str, friends[-MAX_FRIENDS_BATCH:]):
+        if user in seen:
+            continue
+        depth_track[depth] += 1
+        add_friend([user, 0, None, depth])
+        add_user(user)
+        add_tweet([user, 0, 9223372036854775807])
+        add_seen(user)
+
+def get_friends(client=client, queue=friends_queue, root=FRIENDS_DIR):
+    print "// Friends (%s)" % repr(depth_track)[1:-1]
+    while 1:
+        if not queue:
+            return
+        user, i, cursor, depth = xs = queue[0]
+        print "## Looking up Friends for %s" % user
+        dir_path = join(root, user)
+        if not isdir(dir_path):
+            mkdir(dir_path)
+        if isfile(join(dir_path, 'done')):
+            dir_list = listdir(dir_path)
+            dir_list.remove('done')
+            for i in sorted(map(int, dir_list)):
+                if i <= MAX_FRIENDS:
+                    add_friends(read_json(dir_path, str(i))['ids'], depth+1)
+            depth_track[depth] -= 1
+            queue.popleft()
+            continue
+        if not i:
+            dir_list = listdir(dir_path)
+            if dir_list:
+                done = 0
+                for i in sorted(map(int, dir_list)):
+                    if i <= MAX_FRIENDS:
+                        data = read_json(dir_path, str(i))
+                        if data['next_cursor']:
+                            cursor = data['next_cursor']
+                        add_friends(data['ids'], depth+1)
+                    else:
+                        done = 1
+                        break
+                if done:
+                    write('', join(dir_path, 'done'))
+                    depth_track[depth] -= 1
+                    queue.popleft()
+        while i <= MAX_FRIENDS:
+            i += 1
+            if i == 1:
+                print ">> Looking up Friends for %s" % user
+            else:
+                print ">> Looking up Friends for %s (%s)" % (user, i)
+            try:
+                if cursor:
+                    resp = client.friends.ids(user_id=user, count=5000, cursor=cursor)
+                else:
+                    resp = client.friends.ids(user_id=user, count=5000)
+                write(resp.raw_json, join(dir_path, str(i)))
+                add_friends(resp['ids'], depth+1)
+                if resp['next_cursor']:
+                    cursor = resp['next_cursor']
+                    xs[1] = i
+                    xs[2] = cursor
+                else:
+                    write('', join(dir_path, 'done'))
+                    cursor = None
+                    depth_track[depth] -= 1
+                    queue.popleft()
+                if not resp.rate_limit_remaining:
+                    return resp.rate_limit_reset
+                if not cursor:
+                    break
+            except Exception, err:
+                raise err
+
+def get_users(client=client, queue=users_queue, root=USERS_DIR):
+    print "// Users (%s)" % len(queue)
+    users = []; append = users.append
+    appendleft = queue.appendleft
+    popleft = queue.popleft
+    pop = users.pop
+    i = 0
+    while 1:
+        i += 1
+        if not queue:
+            return
+        del users[:]
+        while queue and len(users) < 100:
+            user = popleft()
+            if isfile(join(root, user)):
+                continue
+            append(user)
+        if not users:
+            return
+        users_set = set(users)
+        print ">> Getting %s Users (%s)" % (len(users), i)
+        try:
+            resp = client.users.lookup(user_id=','.join(users), include_entities=True)
+            print ">> Writing ..."
+            for info in resp:
+                uid = info['id_str']
+                users_set.discard(uid)
+                write(encode_json(info), join(root, uid))
+            if users_set:
+                print "!! %s Users unknown: %s" % (len(users_set), ', '.join(sorted(users_set)))
+                for uid in users_set:
+                    write('', join(root, uid))
+            if not resp.rate_limit_remaining:
+                return resp.rate_limit_reset
+        except Exception, err:
+            while users:
+                appendleft(pop())
+            raise err
+
+def get_tweets(client=client, queue=tweets_queue, root=TWEETS_DIR):
+    print "// Tweets (%s)" % len(queue)
+    while 1:
+        if not queue:
+            return
+        user, i, cursor = xs = queue[0]
+        print "## Looking up Tweets for %s" % user
+        dir_path = join(root, user)
+        if not isdir(dir_path):
+            mkdir(dir_path)
+        if isfile(join(dir_path, 'done')):
+            queue.popleft()
+            continue
+        if not i:
+            dir_list = listdir(dir_path)
+            if dir_list:
+                i = sorted(map(int, dir_list))[-1]
+                data = read_json(dir_path, str(i))
+                for tweet in data:
+                    prev_id = tweet['id'] - 1
+                    if prev_id < cursor:
+                        cursor = prev_id
+        while 1:
+            i += 1
+            if i == 1:
+                print ">> Looking up Tweets for %s" % user
+            else:
+                print ">> Looking up Tweets for %s (%s)" % (user, i)
+            try:
+                if i > 1:
+                    resp = client.statuses.user_timeline(
+                        user_id=user, count=200, trim_user=True, exclude_replies=False,
+                        include_rts=True, max_id=cursor
+                        )
+                else:
+                    resp = client.statuses.user_timeline(
+                        user_id=user, count=200, trim_user=True, exclude_replies=False,
+                        include_rts=True
+                        )
+                if len(resp):
+                    for tweet in resp:
+                        prev_id = tweet['id'] - 1
+                        if prev_id < cursor:
+                            cursor = prev_id
+                    xs[1] = i
+                    xs[2] = cursor
+                    write(resp.raw_json, join(dir_path, str(i)))
+                else:
+                    write('', join(dir_path, 'done'))
+                    cursor = None
+                    queue.popleft()
+                if not resp.rate_limit_remaining:
+                    return resp.rate_limit_reset
+                if not cursor:
+                    break
+            except Exception, err:
+                raise err
+
+def print_stats():
+    print "// Stats"
+    print "## Friends (%s) (%s)" % (len(friends_queue), repr(depth_track)[1:-1])
+    print "## Users (%s)" % len(users_queue)
+    print "## Tweets (%s)" % len(tweets_queue)
+    print "## Seen (%s)" % len(seen_users)
+
+# -----------------------------------------------------------------------------
+# Main Loop
+# -----------------------------------------------------------------------------
+
+_next = [None, None, None]
+
+while 1:
+
+    err = None
+
+    if friends_queue:
+        try:
+            _next[0] = get_friends()
+        except Exception, err:
+            print
+            print "!!", err
+            print
+    else:
+        _next[0] = None
+
+    print_stats()
+
+    if users_queue:
+        try:
+            _next[1] = get_users()
+        except Exception, err:
+            print
+            print "!!", err
+            print
+    else:
+        _next[1] = None
+
+    print_stats()
+
+    if tweets_queue:
+        try:
+            _next[2] = get_tweets()
+        except Exception, err:
+            print
+            print "!!", err
+            print
+    else:
+        _next[2] = None
+
+    print_stats()
+
+    if err:
+        print "// Sleeping for 60.0 seconds"
+        sleep(60.0)
+    elif not (_next[0] or _next[1] or _next[2]):
+        exit()
+    else:
+        duration = min(filter(None, _next)) - time()
+        if duration < 0:
+            print "// Sleeping for 2.0 seconds"
+            sleep(2.0)
+        else:
+            print "// Sleeping for %s seconds" % duration
+            sleep(duration)
