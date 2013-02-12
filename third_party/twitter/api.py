@@ -66,8 +66,9 @@ class TwitterResponse(object):
     httplib.HTTPHeaders instance. You can do
     `response.headers.get('h')` to retrieve a header.
     """
-    def __init__(self, headers):
+    def __init__(self, headers, raw_json):
         self.headers = headers
+        self.raw_json = raw_json
 
     @property
     def rate_limit_remaining(self):
@@ -90,8 +91,7 @@ class TwitterResponse(object):
         """
         return int(self.headers.get('X-Rate-Limit-Reset', "0"))
 
-
-def wrap_response(response, headers):
+def wrap_response(response, headers, raw_json=None):
     response_typ = type(response)
     if response_typ is bool:
         # HURF DURF MY NAME IS PYTHON AND I CAN'T SUBCLASS bool.
@@ -102,7 +102,7 @@ def wrap_response(response, headers):
 
         def __init__(self, response, headers):
             response_typ.__init__(self, response)
-            TwitterResponse.__init__(self, headers)
+            TwitterResponse.__init__(self, headers, raw_json)
         def __new__(cls, response, headers):
             return response_typ.__new__(cls, response)
 
@@ -211,7 +211,7 @@ class TwitterCall(object):
 
             if "json" == self.format:
                 res = json.loads(data.decode('utf8'))
-                return wrap_response(res, handle.headers)
+                return wrap_response(res, handle.headers, data)
             else:
                 return wrap_response(
                     data.decode('utf8'), handle.headers)
