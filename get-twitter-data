@@ -159,6 +159,7 @@ def add_friends(
 
 def get_friends(client=client, queue=friends_queue, root=FRIENDS_DIR):
     print "// Friends (%s)" % repr(depth_track)[1:-1]
+    n = 0
     while 1:
         if not queue:
             return
@@ -179,26 +180,24 @@ def get_friends(client=client, queue=friends_queue, root=FRIENDS_DIR):
         if not i:
             dir_list = listdir(dir_path)
             if dir_list:
-                done = 0
                 for i in sorted(map(int, dir_list)):
                     if i <= MAX_FRIENDS:
                         data = read_json(dir_path, str(i))
                         if data['next_cursor']:
                             cursor = data['next_cursor']
                         add_friends(data['ids'], depth+1)
-                    else:
-                        done = 1
-                        break
-                if done:
-                    write('', join(dir_path, 'done'))
-                    depth_track[depth] -= 1
-                    queue.popleft()
-        while i <= MAX_FRIENDS:
+        while 1:
+            if i >= MAX_FRIENDS:
+                write('', join(dir_path, 'done'))
+                depth_track[depth] -= 1
+                queue.popleft()
+                break
             i += 1
+            n += 1
             if i == 1:
-                print ">> Looking up Friends for %s" % user
+                print ">> Looking up Friends for %s [%s]" % (user, n)
             else:
-                print ">> Looking up Friends for %s (%s)" % (user, i)
+                print ">> Looking up Friends for %s (%s) [%s]" % (user, i, n)
             try:
                 if cursor:
                     resp = client.friends.ids(user_id=user, count=5000, cursor=cursor)
@@ -234,15 +233,19 @@ def get_users(client=client, queue=users_queue, root=USERS_DIR):
         if not queue:
             return
         del users[:]
+        predone = 0
         while queue and len(users) < 100:
             user = popleft()
             if isfile(join(root, user)):
+                predone += 1
                 continue
             append(user)
+        if predone:
+            print "## Predone %s/%s Users" % (predone, len(queue))
         if not users:
             return
         users_set = set(users)
-        print ">> Getting %s Users (%s)" % (len(users), i)
+        print ">> Getting %s Users [%s]" % (len(users), i)
         try:
             resp = client.users.lookup(user_id=','.join(users), include_entities=True)
             print ">> Writing ..."
@@ -263,6 +266,7 @@ def get_users(client=client, queue=users_queue, root=USERS_DIR):
 
 def get_tweets(client=client, queue=tweets_queue, root=TWEETS_DIR):
     print "// Tweets (%s)" % len(queue)
+    n = 0
     while 1:
         if not queue:
             return
@@ -285,10 +289,11 @@ def get_tweets(client=client, queue=tweets_queue, root=TWEETS_DIR):
                         cursor = prev_id
         while 1:
             i += 1
+            n += 1
             if i == 1:
-                print ">> Looking up Tweets for %s" % user
+                print ">> Looking up Tweets for %s [%s]" % (user, n)
             else:
-                print ">> Looking up Tweets for %s (%s)" % (user, i)
+                print ">> Looking up Tweets for %s (%s) [%s]" % (user, i, n)
             try:
                 if i > 1:
                     resp = client.statuses.user_timeline(
@@ -300,15 +305,21 @@ def get_tweets(client=client, queue=tweets_queue, root=TWEETS_DIR):
                         user_id=user, count=200, trim_user=True, exclude_replies=False,
                         include_rts=True
                         )
+                done = 0
                 if len(resp):
-                    for tweet in resp:
-                        prev_id = tweet['id'] - 1
-                        if prev_id < cursor:
-                            cursor = prev_id
-                    xs[1] = i
-                    xs[2] = cursor
+                    if i == 16 or len(resp) < 100:
+                        done = 1
+                    else:
+                        for tweet in resp:
+                            prev_id = tweet['id'] - 1
+                            if prev_id < cursor:
+                                cursor = prev_id
+                        xs[1] = i
+                        xs[2] = cursor
                     write(resp.raw_json, join(dir_path, str(i)))
                 else:
+                    done = 1
+                if done:
                     write('', join(dir_path, 'done'))
                     cursor = None
                     queue.popleft()
@@ -335,46 +346,59 @@ _next = [None, None, None]
 while 1:
 
     err = None
+    now = time()
 
     if friends_queue:
-        try:
-            _next[0] = get_friends()
-        except Exception, err:
-            print
-            print "!!", err
-            print
+        do = 1
+        if _next[0] and _next[0] < now:
+            do = 0
+        if do:
+            try:
+                _next[0] = get_friends()
+            except Exception, err:
+                print
+                print "!!", err
+                print
     else:
         _next[0] = None
 
     print_stats()
 
     if users_queue:
-        try:
-            _next[1] = get_users()
-        except Exception, err:
-            print
-            print "!!", err
-            print
+        do = 1
+        if _next[1] and _next[1] < now:
+            do = 0
+        if do:
+            try:
+                _next[1] = get_users()
+            except Exception, err:
+                print
+                print "!!", err
+                print
     else:
         _next[1] = None
 
     print_stats()
 
     if tweets_queue:
-        try:
-            _next[2] = get_tweets()
-        except Exception, err:
-            print
-            print "!!", err
-            print
+        do = 1
+        if _next[2] and _next[2] < now:
+            do = 0
+        if do:
+            try:
+                _next[2] = get_tweets()
+            except Exception, err:
+                print
+                print "!!", err
+                print
     else:
         _next[2] = None
 
     print_stats()
 
     if err:
-        print "// Sleeping for 60.0 seconds"
-        sleep(60.0)
+        print "// Sleeping for 120.0 seconds"
+        sleep(120.0)
     elif not (_next[0] or _next[1] or _next[2]):
         exit()
     else:
